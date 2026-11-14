@@ -2,9 +2,11 @@
 import asyncio
 from sqlalchemy import select, delete, func
 from app.database import Session
-from app.models import CartItem, Product
+from app.models import CartItem, Product, Order
 from app.utils import MAX_QTY
-from app.services.orders import create_order
+
+class _CartChanged(Exception):
+    """Корзина изменилась между чтением и оформлением (например, второй процесс уже оформил её)."""
 
 _locks: dict[int, asyncio.Lock] = {}
 
@@ -107,7 +109,11 @@ def order_text(cart: list[dict]) -> str:
 async def checkout(tg_id: int, user_id: int, point_id: int):
     """Оформление заказа из корзины. Блокировка на пользователя защищает от двойного нажатия.
 
-    Возвращает ("empty",) | ("changed",) | ("ok", order_id, total, items_text).
+    Заказ создаётся и позиции корзины удаляются в ОДНОЙ транзакции: либо оба действия, либо ни одного
+    (сбой посреди оформления не оставит корзину, из которой при повторе получился бы дубль заказа).
+    Удаление позиций по id с проверкой rowcount защищает и от одновременного оформления в другом процессе.
+
+    Возвращает ("empty",) | ("changed",) | ("stale",) | ("ok", order_id, total, items_text).
     """
     lock = _locks.setdefault(tg_id, asyncio.Lock())
     async with lock:
@@ -119,6 +125,17 @@ async def checkout(tg_id: int, user_id: int, point_id: int):
             return ("changed",)
         total = cart_total(cart)
         text = order_text(cart)
-        order_id = await create_order(user_id, point_id, total, text, "")
-        await clear_cart(tg_id)
+        ids = [x["id"] for x in cart]
+        try:
+            async with Session() as s, s.begin():
+                res = await s.execute(delete(CartItem).where(CartItem.id.in_(ids), CartItem.telegram_id == tg_id))
+                if res.rowcount != len(ids):
+                    raise _CartChanged
+                order = Order(user_id=user_id, pickup_point_id=point_id, total_diamonds=total,
+                              items_text=text, notes="", status="pending")
+                s.add(order)
+                await s.flush()
+                order_id = order.id
+        except _CartChanged:
+            return ("stale",)
         return ("ok", order_id, total, text)

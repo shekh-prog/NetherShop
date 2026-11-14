@@ -7,6 +7,7 @@ from app.models import User, Sale
 from app.handlers.common import get_user, nick_taken, sync_head_protection
 from app.states import ProfileFlow
 from app.keyboards import profile_kb, nick_confirm_kb, nick_cancel_kb, main_menu
+from app.services.orders import user_debt
 from app.utils import safe, price_text, valid_nick, NICK_RULES
 from app.branding import send_branded, edit_branded, remember, show
 
@@ -20,8 +21,11 @@ async def profile(message: Message):
         return
     async with Session() as s:
         spent = await s.scalar(select(func.coalesce(func.sum(Sale.total_diamonds), 0)).where(Sale.user_id == user.id))
+    debt, debt_count = await user_debt(user.id)
+    debt_line = (f"\n💎 Долг (оставить в сундуке с заказом): <b>{price_text(debt)}</b> · заказов: {debt_count}"
+                 if debt else "")
     await send_branded(message,
-        f"<b>Твой профиль</b>\nMinecraft-ник: <b>{safe(user.minecraft_nick)}</b>\nПотрачено за всё время: <b>{price_text(int(spent or 0))}</b>",
+        f"<b>Твой профиль</b>\nMinecraft-ник: <b>{safe(user.minecraft_nick)}</b>\nПотрачено за всё время: <b>{price_text(int(spent or 0))}</b>{debt_line}",
         reply_markup=profile_kb())
 
 @router.callback_query(F.data == "profile:change")

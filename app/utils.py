@@ -1,11 +1,23 @@
 import re
+from datetime import datetime, timezone
 from html import escape
+
+
+def utcnow() -> datetime:
+    """Текущее UTC-время без tzinfo (в БД хранятся naive-даты). Замена устаревшему datetime.utcnow()."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 STATUS = {
     "pending": "На рассмотрение",
     "in_progress": "В исполнении",
     "ready": "Прибыл в пункт выдачи",
+    "payment_check": "Проверка оплаты",
 }
+
+# Статусы, в которых заказ ждёт оплаты: сумма заказа считается долгом клиента.
+# Долг не хранится отдельным числом, а считается из заказов — так он не может разойтись с ними
+# (отменили заказ или подтвердили оплату — долг исчез сам).
+DEBT_STATUSES = ("ready", "payment_check")
 
 def price_text(diamonds: int) -> str:
     blocks = f"{diamonds / 9:.1f}".replace(".", ",")

@@ -2,6 +2,7 @@ from datetime import datetime
 from sqlalchemy import String, Integer, BigInteger, Boolean, Text, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from app.database import Base
+from app.utils import utcnow
 
 class User(Base):
     __tablename__ = "users"
@@ -10,7 +11,7 @@ class User(Base):
     minecraft_nick: Mapped[str] = mapped_column(String(32))
     role: Mapped[str] = mapped_column(String(16), default="client")
     telegram_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     banned_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
@@ -30,6 +31,8 @@ class Product(Base):
     price_diamonds: Mapped[int] = mapped_column(Integer)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Порядок внутри категории: из JSON — как в файле, добавленные вручную — в самый низ.
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 class PickupPoint(Base):
     __tablename__ = "pickup_points"
@@ -51,7 +54,7 @@ class Order(Base):
     total_diamonds: Mapped[int] = mapped_column(Integer)
     items_text: Mapped[str] = mapped_column(Text)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class Sale(Base):
@@ -59,7 +62,7 @@ class Sale(Base):
     __tablename__ = "sales"
     id: Mapped[int] = mapped_column(primary_key=True)
     total_diamonds: Mapped[int] = mapped_column(Integer)
-    completed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    completed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
 
 class UnsellableHead(Base):
@@ -69,7 +72,7 @@ class UnsellableHead(Base):
     # Привязка к Telegram-аккаунту: защита головы переживает смену ника.
     telegram_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class CartItem(Base):
@@ -83,4 +86,12 @@ class CartItem(Base):
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
     head_nick: Mapped[str | None] = mapped_column(String(32), nullable=True)
     head_accept: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class FsmState(Base):
+    """Состояние диалогов (FSM) переживает перезапуск бота."""
+    __tablename__ = "fsm_states"
+    key: Mapped[str] = mapped_column(String(200), primary_key=True)
+    state: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    data: Mapped[str] = mapped_column(Text, default="{}")

@@ -22,12 +22,7 @@ subprocess.check_call([
     "install", "-r", str(ROOT / "requirements.txt")
 ])
 
-# Выполняем миграции
-subprocess.check_call([
-    sys.executable, "-m", "alembic",
-    "-c", str(ROOT / "alembic.ini"),
-    "upgrade", "head"
-])
+# Миграции применяет сам бот при старте (app/__main__.py).
 
 # Запускаем бота
 sys.path.insert(0, str(ROOT))

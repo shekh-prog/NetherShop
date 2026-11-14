@@ -5,13 +5,13 @@ from sqlalchemy import select
 from app.database import Session
 from app.models import User
 from app.states import Registration
-from app.utils import NICK_PLACEHOLDER
+from app.utils import NICK_PLACEHOLDER, utcnow
 
 # Постоянный бан хранится как «очень далёкая дата» (None = не забанен).
 PERMANENT_BAN = datetime(9999, 12, 31, 23, 59, 59)
 
 MENU_TEXTS = {"Сделать заказ", "Мои заказы", "Профиль", "Выполнить заказ",
-              "Кастомизииировать", "Статистика"}
+              "Кастомизировать", "Кастомизииировать", "Статистика"}
 
 def _is_start(text: str | None) -> bool:
     return bool(text) and text.split()[0].split("@")[0] == "/start"
@@ -34,7 +34,7 @@ class AccessMiddleware(BaseMiddleware):
                 if user.telegram_username != actor.username:
                     user.telegram_username = actor.username
                     changed = True
-                if user.banned_until is not None and user.banned_until <= datetime.utcnow():
+                if user.banned_until is not None and user.banned_until <= utcnow():
                     user.banned_until = None
                     changed = True
                 if changed:

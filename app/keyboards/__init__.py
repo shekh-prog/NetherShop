@@ -7,7 +7,7 @@ def main_menu(role: str):
     if role in ("worker", "admin"):
         rows.append([KeyboardButton(text="Выполнить заказ")])
     if role == "admin":
-        rows.append([KeyboardButton(text="Кастомизииировать")])
+        rows.append([KeyboardButton(text="Кастомизировать")])
         rows.append([KeyboardButton(text="Статистика")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
@@ -123,11 +123,13 @@ def pickup_kb(points):
 
 def worker_orders_kb(orders):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Заказ #{o.id} · {o.minecraft_nick}", callback_data=f"worker:order:{o.id}")]
+        [InlineKeyboardButton(
+            text=f"Заказ #{o.id} · {o.minecraft_nick}" + (" · 💰 проверка оплаты" if o.status == "payment_check" else ""),
+            callback_data=f"worker:order:{o.id}")]
         for o in orders
     ])
 
-def order_actions(order_id: int, status: str, worker_id: int | None, current_worker_id: int):
+def order_actions(order_id: int, status: str, worker_id: int | None, current_worker_id: int, total_diamonds: int = 1):
     rows = []
     if status == "pending":
         rows.append([InlineKeyboardButton(text="Принять", callback_data=f"worker:accept:{order_id}")])
@@ -135,7 +137,12 @@ def order_actions(order_id: int, status: str, worker_id: int | None, current_wor
     if worker_id == current_worker_id and status == "in_progress":
         rows.append([InlineKeyboardButton(text="Заказ готов", callback_data=f"worker:ready:{order_id}")])
         rows.append([InlineKeyboardButton(text="Бросить заказ", callback_data=f"worker:release:{order_id}")])
-    if worker_id == current_worker_id and status != "pending":
+    # Оплату подтверждает любой сотрудник, когда клиент уже забрал заказ («Проверка оплаты»).
+    # Исполнитель, доставивший заказ, может подтвердить её и раньше — если клиент забыл нажать «Забрал заказ».
+    if total_diamonds > 0 and (status == "payment_check" or (status == "ready" and worker_id == current_worker_id)):
+        rows.append([InlineKeyboardButton(text="Подтвердить оплату", callback_data=f"worker:paid:{order_id}")])
+    # Отменить заказ, который клиент уже забрал, нельзя: иначе долг молча исчезнет.
+    if worker_id == current_worker_id and status not in ("pending", "payment_check"):
         rows.append([InlineKeyboardButton(text="Отменить", callback_data=f"worker:cancel:{order_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
