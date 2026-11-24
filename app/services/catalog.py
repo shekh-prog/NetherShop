@@ -27,7 +27,7 @@ async def export_catalog() -> bytes:
             products_result = await session.execute(
                 select(Product).where(
                     Product.category == category.key, Product.is_active.is_(True)
-                ).order_by(Product.name)
+                ).order_by(Product.sort_order, Product.id)
             )
             data[category.key] = {
                 "button": category.button,
@@ -114,23 +114,36 @@ async def apply_catalog(data):
                 category.button = category_data["button"]
                 category.is_active = True
 
-            incoming_names = set()
-            for name, portion, price in category_data["items"]:
-                incoming_names.add(name.casefold())
-                result = await session.execute(
-                    select(Product).where(Product.category == key, Product.name == name)
-                )
-                product = result.scalar_one_or_none()
-                if product is None:
-                    session.add(Product(category=key, name=name, portion_size=portion,
-                                        price_diamonds=price, description=None, is_active=True))
-                else:
-                    product.portion_size = portion
-                    product.price_diamonds = price
-                    product.is_active = True
+            # Все строки категории (в том числе скрытые). Названия сравниваются без учёта регистра.
+            # Дубли по названию возможны (скрыли товар и создали такой же заново) — это не должно ронять загрузку:
+            # обновляем одну запись (предпочтительно активную), остальные дубли скрываем.
+            existing_all = (await session.execute(select(Product).where(Product.category == key))).scalars().all()
+            by_name: dict[str, list[Product]] = {}
+            for product in existing_all:
+                by_name.setdefault(product.name.casefold(), []).append(product)
 
-            existing = await session.execute(select(Product).where(Product.category == key, Product.is_active.is_(True)))
-            for product in existing.scalars().all():
+            incoming_names = set()
+            for position, (name, portion, price) in enumerate(category_data["items"]):
+                folded = name.casefold()
+                incoming_names.add(folded)
+                group = by_name.get(folded)
+                if not group:
+                    product = Product(category=key, name=name, portion_size=portion,
+                                      price_diamonds=price, description=None, is_active=True, sort_order=position)
+                    session.add(product)
+                    by_name[folded] = [product]
+                    continue
+                group.sort(key=lambda p: (not p.is_active, p.id or 0))
+                main = group[0]
+                main.name = name
+                main.portion_size = portion
+                main.price_diamonds = price
+                main.is_active = True
+                main.sort_order = position
+                for duplicate in group[1:]:
+                    duplicate.is_active = False
+
+            for product in existing_all:
                 if product.name.casefold() not in incoming_names:
                     product.is_active = False
 

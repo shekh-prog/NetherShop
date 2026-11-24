@@ -3,11 +3,11 @@ from app.utils import price_text, MAX_QTY
 
 def main_menu(role: str):
     rows = [[KeyboardButton(text="Сделать заказ"), KeyboardButton(text="Мои заказы")],
-            [KeyboardButton(text="Профиль")]]
+            [KeyboardButton(text="Профиль"), KeyboardButton(text="Промокод")]]
     if role in ("worker", "admin"):
         rows.append([KeyboardButton(text="Выполнить заказ")])
     if role == "admin":
-        rows.append([KeyboardButton(text="Кастомизииировать")])
+        rows.append([KeyboardButton(text="Кастомизировать")])
         rows.append([KeyboardButton(text="Статистика")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
@@ -123,11 +123,13 @@ def pickup_kb(points):
 
 def worker_orders_kb(orders):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Заказ #{o.id} · {o.minecraft_nick}", callback_data=f"worker:order:{o.id}")]
+        [InlineKeyboardButton(
+            text=f"Заказ #{o.id} · {o.minecraft_nick}" + (" · 💰 проверка оплаты" if o.status == "payment_check" else ""),
+            callback_data=f"worker:order:{o.id}")]
         for o in orders
     ])
 
-def order_actions(order_id: int, status: str, worker_id: int | None, current_worker_id: int):
+def order_actions(order_id: int, status: str, worker_id: int | None, current_worker_id: int, total_diamonds: int = 1):
     rows = []
     if status == "pending":
         rows.append([InlineKeyboardButton(text="Принять", callback_data=f"worker:accept:{order_id}")])
@@ -135,7 +137,12 @@ def order_actions(order_id: int, status: str, worker_id: int | None, current_wor
     if worker_id == current_worker_id and status == "in_progress":
         rows.append([InlineKeyboardButton(text="Заказ готов", callback_data=f"worker:ready:{order_id}")])
         rows.append([InlineKeyboardButton(text="Бросить заказ", callback_data=f"worker:release:{order_id}")])
-    if worker_id == current_worker_id and status != "pending":
+    # Оплату подтверждает любой сотрудник, когда клиент уже забрал заказ («Проверка оплаты»).
+    # Исполнитель, доставивший заказ, может подтвердить её и раньше — если клиент забыл нажать «Забрал заказ».
+    if total_diamonds > 0 and (status == "payment_check" or (status == "ready" and worker_id == current_worker_id)):
+        rows.append([InlineKeyboardButton(text="Подтвердить оплату", callback_data=f"worker:paid:{order_id}")])
+    # Отменить заказ, который клиент уже забрал, нельзя: иначе долг молча исчезнет.
+    if worker_id == current_worker_id and status not in ("pending", "payment_check"):
         rows.append([InlineKeyboardButton(text="Отменить", callback_data=f"worker:cancel:{order_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -154,3 +161,105 @@ def my_order_kb(order_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Забрал заказ", callback_data=f"order:claimed:{order_id}")]
     ])
+
+
+# ---------------------------------------------------------------- промокоды
+
+def _btn(text, data):
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+def promo_menu_kb(is_admin: bool):
+    rows = [[_btn("Ввести промокод", "promo:enter")], [_btn("Мои промокоды", "promo:mine")]]
+    if is_admin:
+        rows.append([_btn("Создать промокод", "promo:new")])
+        rows.append([_btn("Список промокодов", "promo:list")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def back_kb(data: str):
+    return InlineKeyboardMarkup(inline_keyboard=[[_btn("⬅️ Назад", data)]])
+
+def my_promos_kb(items: list[dict]):
+    rows = [[_btn(f"{'🟢' if x['is_active'] else '🔴'} {(x['name'] or x['code'])[:50]}", f"promo:my:{x['rid']}")] for x in items]
+    rows.append([_btn("⬅️ Назад", "promo:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def my_promo_view_kb(item: dict):
+    rows = []
+    if item["used_order_id"] is None:
+        if item["is_active"]:
+            rows.append([_btn("Деактивировать", f"promo:tg:{item['rid']}:0")])
+        else:
+            rows.append([_btn("Активировать", f"promo:tg:{item['rid']}:1")])
+    rows.append([_btn("⬅️ Назад", "promo:mine")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def promo_cats_kb(categories):
+    """Выбор области действия нового промокода: как каталог, но снизу «На всё»."""
+    rows = [[_btn(name, f"pn:cat:{key}")] for key, name in categories.items() if key != "heads"]
+    rows.append([_btn("На всё", "pn:all")])
+    rows.append([_btn("⬅️ Назад", "promo:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def promo_products_kb(products, category: str):
+    rows = [[_btn(f"{p.portion_size} шт. · {p.name} · {price_text(p.price_diamonds)}"[:60], f"pn:prod:{p.id}")] for p in products]
+    rows.append([_btn("На всё", f"pn:allcat:{category}")])
+    rows.append([_btn("⬅️ Назад", "pn:new")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def promo_product_confirm_kb(product_id: int, category: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("⬅️ Назад", f"pn:cat:{category}"), _btn("Подтвердить", f"pn:ok:{product_id}")]
+    ])
+
+def promo_cancel_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[_btn("Отмена", "pn:cancel")]])
+
+def promo_list_kb(promos):
+    rows = [[_btn(f"{(p.name or p.code)[:40]} · −{p.percent}%", f"promo:view:{p.id}")] for p in promos]
+    rows.append([_btn("⬅️ Назад", "promo:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def promo_view_kb(promo_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("🗑 Удалить", f"promo:del:{promo_id}")],
+        [_btn("⬅️ Назад", "promo:list")],
+    ])
+
+def promo_delete_confirm_kb(promo_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("Да, удалить", f"promo:delyes:{promo_id}"), _btn("Нет", f"promo:view:{promo_id}")]
+    ])
+
+# ---------------------------------------------------------------- редактор каталога (глава)
+
+def _confirm_label(n: int) -> str:
+    return f"✅ Подтвердить ({n})" if n else "✅ Подтвердить"
+
+def ed_cats_kb(categories, n_changes: int):
+    rows = [[_btn(name, f"ed:cat:{key}")] for key, name in categories.items() if key != "heads"]
+    rows.append([_btn(_confirm_label(n_changes), "ed:ok")])
+    rows.append([_btn("Отменить правки и выйти", "ed:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def ed_products_kb(items, n_changes: int):
+    """items: список (id, подпись). Подпись уже учитывает ещё не подтверждённые правки."""
+    rows = [[_btn(label[:60], f"ed:p:{pid}")] for pid, label in items]
+    rows.append([_btn(_confirm_label(n_changes), "ed:ok")])
+    rows.append([_btn("⬅️ Категории", "ed:cats")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def ed_card_kb(product_id: int, category: str, edited: bool, hidden: bool, n_changes: int):
+    rows = [
+        [_btn("✏️ Имя", f"ed:f:{product_id}:name"), _btn("💰 Цена", f"ed:f:{product_id}:price"),
+         _btn("📦 Шт. в порции", f"ed:f:{product_id}:portion")],
+        [_btn("📝 Описание", f"ed:f:{product_id}:desc")],
+        [_btn("↩️ Вернуть товар" if hidden else "🗑 Скрыть товар", f"ed:hide:{product_id}")],
+    ]
+    if edited:
+        rows.append([_btn("🔄 Сбросить правки товара", f"ed:reset:{product_id}")])
+    rows.append([_btn(_confirm_label(n_changes), "ed:ok")])
+    rows.append([_btn("⬅️ Назад", f"ed:cat:{category}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def ed_input_back_kb(product_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[[_btn("⬅️ Назад", f"ed:p:{product_id}")]])

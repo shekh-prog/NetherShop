@@ -1,10 +1,13 @@
 """Корзина в БД, привязанная к telegram_id (не зависит ни от ника, ни от FSM)."""
 import asyncio
-from sqlalchemy import select, delete, func
+from sqlalchemy import select, delete, update, func
 from app.database import Session
-from app.models import CartItem, Product
-from app.utils import MAX_QTY
-from app.services.orders import create_order
+from app.models import CartItem, Product, Order, PromoRedemption
+from app.utils import MAX_QTY, utcnow
+from app.services import promo as promosvc
+
+class _CartChanged(Exception):
+    """Корзина изменилась между чтением и оформлением (например, второй процесс уже оформил её)."""
 
 _locks: dict[int, asyncio.Lock] = {}
 
@@ -18,11 +21,12 @@ async def get_cart(tg_id: int) -> list[dict]:
     lines = []
     for i in items:
         if i.product_id is None:
-            lines.append(dict(id=i.id, product_id=None, name=f"Голова игрока {i.head_nick}", portion=1, price=0,
+            lines.append(dict(id=i.id, product_id=None, category=None, name=f"Голова игрока {i.head_nick}", portion=1, price=0,
                               qty=1, details="", head_nick=i.head_nick, head_accept=i.head_accept, available=True))
         else:
             p = prods.get(i.product_id)
-            lines.append(dict(id=i.id, product_id=i.product_id, name=p.name if p else "Товар удалён",
+            lines.append(dict(id=i.id, product_id=i.product_id, category=p.category if p else None,
+                              name=p.name if p else "Товар удалён",
                               portion=p.portion_size if p else 0, price=p.price_diamonds if p else 0,
                               qty=i.quantity, details=i.details or "", head_nick=None, head_accept=False,
                               available=bool(p and p.is_active)))
@@ -107,7 +111,14 @@ def order_text(cart: list[dict]) -> str:
 async def checkout(tg_id: int, user_id: int, point_id: int):
     """Оформление заказа из корзины. Блокировка на пользователя защищает от двойного нажатия.
 
-    Возвращает ("empty",) | ("changed",) | ("ok", order_id, total, items_text).
+    Заказ создаётся и позиции корзины удаляются в ОДНОЙ транзакции: либо оба действия, либо ни одного
+    (сбой посреди оформления не оставит корзину, из которой при повторе получился бы дубль заказа).
+    Удаление позиций по id с проверкой rowcount защищает и от одновременного оформления в другом процессе.
+
+    Если у игрока активен промокод и он подходит к товарам в корзине, скидка применяется к сумме заказа,
+    а промокод в той же транзакции помечается использованным. В заказ (и в продажи) идёт сумма уже со скидкой.
+
+    Возвращает ("empty",) | ("changed",) | ("stale",) | ("ok", order_id, total, items_text, discount).
     """
     lock = _locks.setdefault(tg_id, asyncio.Lock())
     async with lock:
@@ -119,6 +130,34 @@ async def checkout(tg_id: int, user_id: int, point_id: int):
             return ("changed",)
         total = cart_total(cart)
         text = order_text(cart)
-        order_id = await create_order(user_id, point_id, total, text, "")
-        await clear_cart(tg_id)
-        return ("ok", order_id, total, text)
+        promo = await promosvc.get_active_promo(user_id)
+        _, discount = promosvc.compute_discount(cart, promo)
+        if promo and discount > 0:
+            text += f"\nПромокод {promo['code']} (−{promo['percent']}%): −{discount} алм."
+        else:
+            promo, discount = None, 0
+        ids = [x["id"] for x in cart]
+        try:
+            async with Session() as s, s.begin():
+                res = await s.execute(delete(CartItem).where(CartItem.id.in_(ids), CartItem.telegram_id == tg_id))
+                if res.rowcount != len(ids):
+                    raise _CartChanged
+                if promo:
+                    # Промокод сгорает вместе с оформлением заказа: помечаем использованным в той же транзакции.
+                    res = await s.execute(update(PromoRedemption).where(
+                        PromoRedemption.id == promo["rid"], PromoRedemption.is_active.is_(True)
+                    ).values(is_active=False, used_at=utcnow()))
+                    if res.rowcount != 1:
+                        raise _CartChanged
+                order = Order(user_id=user_id, pickup_point_id=point_id, total_diamonds=total - discount,
+                              items_text=text, notes="", status="pending",
+                              promo_redemption_id=promo["rid"] if promo else None)
+                s.add(order)
+                await s.flush()
+                order_id = order.id
+                if promo:
+                    await s.execute(update(PromoRedemption).where(PromoRedemption.id == promo["rid"])
+                                    .values(used_order_id=order_id))
+        except _CartChanged:
+            return ("stale",)
+        return ("ok", order_id, total - discount, text, discount)

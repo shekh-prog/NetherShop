@@ -7,12 +7,9 @@ from app import models  # noqa: F401
 
 config = context.config
 
-import os
+from app.config import settings
 
-database_url = os.getenv(
-    "DATABASE_URL",
-    "sqlite+aiosqlite:////app/data/nethershop.db"
-)
+database_url = settings.database_url
 
 config.set_main_option(
     "sqlalchemy.url",
@@ -20,7 +17,8 @@ config.set_main_option(
 )
 
 if config.config_file_name:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False: иначе миграции при запуске из бота отключат логгеры самого бота.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 target_metadata = Base.metadata
 
 def run_migrations_offline():

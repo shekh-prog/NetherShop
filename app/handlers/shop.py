@@ -11,9 +11,10 @@ from app.keyboards import (main_menu, categories_kb, products_kb, item_controls,
                            pickup_kb, my_order_kb, heads_menu_kb, unique_head_kb, head_back_kb,
                            head_confirm_kb, clear_confirm_kb)
 from app.handlers.common import get_user, nick_taken, sync_head_protection
-from app.utils import STATUS, MAX_QTY, price_text, safe, valid_nick, NICK_RULES, NICK_PLACEHOLDER
-from app.services.orders import list_user_orders, claim_order
+from app.utils import STATUS, MAX_QTY, price_text, safe, valid_nick, NICK_RULES, NICK_PLACEHOLDER, utcnow, DEBT_STATUSES
+from app.services.orders import list_user_orders, claim_order, get_order
 from app.services import cart as cartsvc
+from app.services import promo as promosvc
 from app.services.cart import cart_total
 from app.branding import send_branded, edit_branded, edit_message, ref_of, remember, show
 
@@ -31,6 +32,21 @@ def cart_summary(cart):
         if x.get("head_nick"): lines.append(f"   Ответственность: {'принята' if x.get('head_accept') else 'не принята'}")
         if not x["available"]: lines.append("   ⚠️ Товар больше недоступен — он будет убран при оформлении.")
     return "\n".join(lines) + f"\n\n<b>Итого: {price_text(cart_total(cart))}</b>"
+
+async def cart_text(tg_id: int, cart: list[dict]) -> str:
+    """Корзина + строка со скидкой, если у игрока активен подходящий промокод."""
+    text = cart_summary(cart)
+    user = await get_user(tg_id)
+    promo = await promosvc.get_active_promo(user.id) if user and cart else None
+    if not promo:
+        return text
+    _, discount = promosvc.compute_discount(cart, promo)
+    if discount <= 0:
+        return text + (f"\n\n🏷 Промокод <b>{safe(promosvc.promo_title(promo))}</b> (−{promo['percent']}%) активен, "
+                       "но не подходит к товарам в корзине.")
+    total = cart_total(cart)
+    return (text + f"\n🏷 Промокод <b>{safe(promosvc.promo_title(promo))}</b> (−{promo['percent']}%): −{price_text(discount)}"
+            f"\n<b>К оплате: {price_text(total - discount)}</b>")
 
 async def total_line(tg_id: int) -> str:
     return f"Текущий итог: {price_text(cart_total(await cartsvc.get_cart(tg_id)))}"
@@ -95,7 +111,11 @@ async def my_orders(message: Message):
     for order, point in rows:
         text = (f"<b>Заказ #{order.id}</b>\n{safe(order.items_text)}\n\nПункт выдачи: {safe(point.name)} — {safe(point.dimension)} ({point.x}, {point.y}, {point.z})\n"
                 f"Сумма: {price_text(order.total_diamonds)}\nСтатус: <b>{STATUS.get(order.status, order.status)}</b>")
-        await message.answer(text, reply_markup=my_order_kb(order.id))
+        if order.status in DEBT_STATUSES and order.total_diamonds > 0:
+            text += (f"\n\n💎 К оплате: <b>{price_text(order.total_diamonds)}</b> — оставь в одном из сундуков, "
+                     "в котором лежит заказ.")
+        # Кнопка «Забрал заказ» имеет смысл только пока заказ ждёт клиента в пункте выдачи.
+        await message.answer(text, reply_markup=my_order_kb(order.id) if order.status == "ready" else None)
 
 @router.callback_query(F.data.startswith("order:claimed:"))
 async def order_claimed(call: CallbackQuery):
@@ -103,11 +123,32 @@ async def order_claimed(call: CallbackQuery):
     if not user:
         await call.answer("Пользователь не найден.", show_alert=True); return
     order_id = int(call.data.rsplit(":", 1)[1])
-    ok = await claim_order(order_id, user.id)
-    if not ok:
+    result = await claim_order(order_id, user.id)
+    if result is None:
         await call.answer("Забрать можно только заказ, прибывший в пункт выдачи.", show_alert=True); return
-    await edit_branded(call, f"Заказ #{order_id} отмечен как забранный и удалён из списка заказов. Спасибо за покупку в NetherShop!")
-    await call.answer("Заказ завершён.", show_alert=True)
+    if result == "done":
+        # Заказ без суммы (только головы): оплаты в сундуке нет, закрываем сразу.
+        await edit_branded(call, f"Заказ #{order_id} отмечен как забранный и удалён из списка заказов. Спасибо за покупку в NetherShop!")
+        await call.answer("Заказ завершён.", show_alert=True)
+        return
+    row = await get_order(order_id)
+    total = row[0].total_diamonds if row else 0
+    await edit_branded(call, f"Заказ #{order_id} отмечен как забранный.\n\n"
+                             f"💎 К оплате: <b>{price_text(total)}</b>. Если ещё не оставил оплату — оставь её в одном из сундуков, "
+                             "в котором лежал заказ. Сотрудник проверит оплату и закроет заказ; до этого он остаётся "
+                             "в списке со статусом «Проверка оплаты», а долг — в твоём профиле.")
+    await call.answer("Заказ ждёт проверки оплаты.", show_alert=True)
+    if row and row[0].worker_id:
+        # Сообщаем исполнителю, который доставил заказ; подтвердить оплату при этом может любой сотрудник.
+        async with Session() as s:
+            courier = await s.get(User, row[0].worker_id)
+        if courier:
+            try:
+                await call.bot.send_message(courier.telegram_id,
+                    f"Клиент {safe(user.minecraft_nick)} забрал заказ #{order_id}. "
+                    f"Проверьте оплату ({price_text(total)}) в «Выполнить заказ».")
+            except Exception:
+                pass
 
 # ---------------------------------------------------------------- каталог
 
@@ -129,7 +170,7 @@ async def show_products(call: CallbackQuery, state: FSMContext):
     if category not in categories or category == "heads":
         await call.answer("Категория не найдена.", show_alert=True); return
     async with Session() as s:
-        q = await s.execute(select(Product).where(Product.category == category, Product.is_active.is_(True)).order_by(Product.name))
+        q = await s.execute(select(Product).where(Product.category == category, Product.is_active.is_(True)).order_by(Product.sort_order, Product.id))
         products = q.scalars().all()
     if not products:
         await edit_branded(call, "В этой категории пока нет товаров.", reply_markup=categories_kb(await get_categories()))
@@ -294,11 +335,10 @@ async def head_nick(message: Message, state: FSMContext):
     if not valid_nick(nick):
         await show(message, state, f"Некорректный ник. {NICK_RULES}\n\nВведи ник ещё раз или нажми «Назад».", head_back_kb())
         return
-    from datetime import datetime
     async with Session() as s:
         q = await s.execute(select(UnsellableHead).where(func.lower(UnsellableHead.nickname) == nick.lower()))
         protected = q.scalars().first()
-        if protected and protected.expires_at is not None and protected.expires_at <= datetime.utcnow():
+        if protected and protected.expires_at is not None and protected.expires_at <= utcnow():
             await s.delete(protected)
             await s.commit()
             protected = None
@@ -340,7 +380,7 @@ async def head_decline(call: CallbackQuery, state: FSMContext):
 
 async def show_cart(call: CallbackQuery):
     cart = await cartsvc.get_cart(call.from_user.id)
-    await edit_branded(call, cart_summary(cart), reply_markup=cart_kb(cart))
+    await edit_branded(call, await cart_text(call.from_user.id, cart), reply_markup=cart_kb(cart))
 
 @router.callback_query(F.data == "cart:view")
 async def view_cart(call: CallbackQuery, state: FSMContext):
@@ -381,7 +421,16 @@ async def checkout(call: CallbackQuery):
     if not points:
         await call.answer("Пункты выдачи пока не настроены.", show_alert=True); return
     note = "\n⚠️ Недоступные товары убраны из корзины." if removed else ""
-    await edit_branded(call, f"Итого: <b>{price_text(cart_total(cart))}</b>{note}\nВыбери пункт выдачи:", reply_markup=pickup_kb(points))
+    total = cart_total(cart)
+    user = await get_user(call.from_user.id)
+    promo = await promosvc.get_active_promo(user.id) if user else None
+    _, discount = promosvc.compute_discount(cart, promo)
+    if discount > 0:
+        sum_line = (f"Итого: <b>{price_text(total - discount)}</b> "
+                    f"(промокод −{promo['percent']}%: −{price_text(discount)})")
+    else:
+        sum_line = f"Итого: <b>{price_text(total)}</b>"
+    await edit_branded(call, f"{sum_line}{note}\nВыбери пункт выдачи:", reply_markup=pickup_kb(points))
     await call.answer()
 
 @router.callback_query(F.data.startswith("pickup:"))
@@ -401,11 +450,15 @@ async def choose_pickup(call: CallbackQuery):
     result = await cartsvc.checkout(call.from_user.id, user.id, point_id)
     if result[0] == "empty":
         await call.answer("Корзина пуста.", show_alert=True); return
+    if result[0] == "stale":
+        await call.answer("Корзина изменилась. Проверь её и оформи заказ ещё раз.", show_alert=True)
+        await show_cart(call); return
     if result[0] == "changed":
         await call.answer("Часть товаров стала недоступна и убрана из корзины. Проверь корзину.", show_alert=True)
         await show_cart(call); return
-    _, order_id, total, items_text = result
-    await edit_branded(call, f"Заказ <b>#{order_id}</b> отправлен исполнителям!\nСумма: {price_text(total)}")
+    _, order_id, total, items_text, discount = result
+    promo_note = f"\nПромокод применён: −{price_text(discount)}." if discount else ""
+    await edit_branded(call, f"Заказ <b>#{order_id}</b> отправлен исполнителям!\nСумма: {price_text(total)}{promo_note}")
     async with Session() as s:
         q = await s.execute(select(User).where(User.role.in_(["worker", "admin"])))
         workers = q.scalars().all()

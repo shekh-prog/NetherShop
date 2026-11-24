@@ -5,11 +5,11 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from sqlalchemy import select, func, delete, update
 from app.database import Session
-from app.models import User, Product, PickupPoint, Order, Sale, CartItem
+from app.models import User, Product, PickupPoint, Order, Sale, CartItem, PromoRedemption
 from app.handlers.common import get_user
 from app.keyboards import admin_menu
 from app.states import AdminFlow
-from app.utils import safe, price_text, NICK_PLACEHOLDER, valid_nick
+from app.utils import safe, price_text, NICK_PLACEHOLDER, valid_nick, utcnow
 from app.models import Category
 from app.services.catalog import export_catalog, apply_catalog, parse_catalog_json, get_categories
 from app.middleware import PERMANENT_BAN
@@ -41,11 +41,13 @@ async def send_stats(target):
     week_sum, week_count = stats["week"]
     month_sum, month_count = stats["month"]
     all_sum, all_count = stats["all"]
+    unpaid_sum, unpaid_count = stats["unpaid"]
     text = ("<b>Статистика NetherShop</b>\n\n"
             f"За 7 дней: <b>{price_text(week_sum)}</b> · заказов: {week_count}\n"
             f"За 30 дней: <b>{price_text(month_sum)}</b> · заказов: {month_count}\n"
             f"За всё время: <b>{price_text(all_sum)}</b> · заказов: {all_count}\n\n"
-            "Учитываются только заказы, которые покупатели отметили как забранные.")
+            f"Ждёт оплаты: <b>{price_text(unpaid_sum)}</b> · заказов: {unpaid_count}\n\n"
+            "В продажи попадают только заказы с подтверждённой сотрудником оплатой.")
     if isinstance(target, Message):
         await target.answer(text)
     else:
@@ -56,7 +58,8 @@ async def stats_callback(call: CallbackQuery):
     await send_stats(call)
     await call.answer()
 
-@router.message(F.text == "Кастомизииировать")
+# «Кастомизииировать» — старое написание кнопки: у тех, кто не нажимал /start, клавиатура ещё со старым текстом.
+@router.message(F.text.in_({"Кастомизировать", "Кастомизииировать"}))
 async def customize(message: Message):
     await message.answer("Панель главы NetherShop:", reply_markup=admin_menu())
 
@@ -102,21 +105,7 @@ async def product_price(message: Message, state: FSMContext):
     await state.update_data(product_price=n); await state.set_state(AdminFlow.product_description)
     await message.answer("Описание/подробности товара (или отправь «-» для пропуска):")
 
-@router.callback_query(F.data == "admin:products")
-async def list_products(call: CallbackQuery):
-    async with Session() as s:
-        q = await s.execute(select(Product).where(Product.is_active.is_(True)).order_by(Product.category, Product.name)); items = q.scalars().all()
-        cq = await s.execute(select(Category).where(Category.is_active.is_(True)))
-        category_names = {c.key: c.button for c in cq.scalars().all()}
-    if not items: await call.message.answer("Каталог пуст.")
-    for p in items:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Изменить цену", callback_data=f"admin:price:{p.id}"),
-             InlineKeyboardButton(text="Изменить описание", callback_data=f"admin:description:{p.id}")],
-            [InlineKeyboardButton(text="Удалить", callback_data=f"admin:delete_product:{p.id}")]
-        ])
-        await call.message.answer(f"{safe(category_names.get(p.category,p.category))}: {safe(p.name)}\n{p.portion_size} шт. · {price_text(p.price_diamonds)}\n{safe(p.description or 'Без описания')}", reply_markup=kb)
-    await call.answer()
+# «Список товаров» теперь открывает редактор каталога — см. app/handlers/editor.py.
 
 @router.callback_query(F.data.startswith("admin:delete_product:"))
 async def delete_product(call: CallbackQuery):
@@ -174,9 +163,26 @@ async def description_save(message: Message, state: FSMContext):
         return
     desc = None if (message.text or "").strip() in ("—", "-") else (message.text or "").strip()
     async with Session() as s:
-        p = Product(category=data["product_category"], name=data["product_name"], portion_size=data["product_portion"],
-                    price_diamonds=data["product_price"], description=desc, is_active=True)
-        s.add(p); await s.commit()
+        same = [p for p in (await s.execute(select(Product).where(Product.category == data["product_category"]))).scalars().all()
+                if p.name.casefold() == data["product_name"].casefold()]   # lower() в SQLite не понимает кириллицу
+        # Новый (или возвращённый) товар встаёт в самый низ категории.
+        bottom = (await s.scalar(select(func.max(Product.sort_order)).where(Product.category == data["product_category"]))) or 0
+        if any(p.is_active for p in same):
+            await state.clear()
+            await message.answer(f"Товар «{safe(data['product_name'])}» в этой категории уже есть. "
+                                 "Измени его через «Список товаров».")
+            return
+        if same:
+            # Раньше скрытый товар с таким названием — возвращаем его, а не создаём дубль.
+            p = sorted(same, key=lambda x: x.id)[0]
+            p.name = data["product_name"]; p.portion_size = data["product_portion"]
+            p.price_diamonds = data["product_price"]; p.description = desc; p.is_active = True
+            p.sort_order = bottom + 1
+        else:
+            s.add(Product(category=data["product_category"], name=data["product_name"], portion_size=data["product_portion"],
+                          price_diamonds=data["product_price"], description=desc, is_active=True,
+                          sort_order=bottom + 1))
+        await s.commit()
     await state.clear()
     await message.answer(f"Товар добавлен: {safe(data['product_name'])} — {price_text(data['product_price'])}")
 
@@ -347,11 +353,11 @@ def add_months(value: datetime, months: int) -> datetime:
     day = min(value.day, calendar.monthrange(year, month)[1])
     return value.replace(year=year, month=month, day=day)
 
-@router.message(Command("male_unsellable_head", "make_unsellable_head"))
-async def male_unsellable_head(message: Message):
+@router.message(Command("make_unsellable_head", "male_unsellable_head"))
+async def make_unsellable_head(message: Message):
     parts = (message.text or "").split()
     if len(parts) not in (2, 3):
-        await message.answer("Использование: /male_unsellable_head &lt;nickname&gt; [число_месяцев]. Без числа месяцев — навсегда.")
+        await message.answer("Использование: /make_unsellable_head &lt;nickname&gt; [число_месяцев]. Без числа месяцев — навсегда.")
         return
     nick = parts[1]
     if not valid_nick(nick):
@@ -362,7 +368,7 @@ async def male_unsellable_head(message: Message):
         except ValueError: months = 0
         if months < 1 or months > 1200:
             await message.answer("Число месяцев должно быть от 1 до 1200."); return
-    expires = add_months(datetime.utcnow(), months) if months else None
+    expires = add_months(utcnow(), months) if months else None
     async with Session() as s:
         q = await s.execute(select(UnsellableHead).where(ci_nick(UnsellableHead.nickname, nick)))
         obj = q.scalars().first()
@@ -390,9 +396,9 @@ async def make_sellable_head(message: Message):
             await s.delete(obj); await s.commit()
     await message.answer(f"Голова {safe(parts[1])} снова доступна для заказа.")
 
-@router.message(Command("list_unsallable_heads", "list_unsellable_heads"))
-async def list_unsallable_heads(message: Message):
-    now = datetime.utcnow()
+@router.message(Command("list_unsellable_heads", "list_unsallable_heads"))
+async def list_unsellable_heads(message: Message):
+    now = utcnow()
     async with Session() as s:
         q = await s.execute(select(UnsellableHead).order_by(UnsellableHead.nickname))
         rows = q.scalars().all()
@@ -425,7 +431,7 @@ async def ban_player(message: Message):
         except ValueError: days = 0
         if days < 1 or days > 36500:
             await message.answer("Количество дней должно быть от 1 до 36500."); return
-        until = datetime.utcnow() + timedelta(days=days)
+        until = utcnow() + timedelta(days=days)
     async with Session() as s:
         q = await s.execute(select(User).where(ci_nick(User.minecraft_nick, nick)))
         user = q.scalars().first()
@@ -508,7 +514,52 @@ async def delete_player(message: Message):
                         .values(status="pending", worker_id=None))
         await s.execute(update(Order).where(Order.worker_id == user.id).values(worker_id=None))
         await s.execute(update(Sale).where(Sale.user_id == user.id).values(user_id=None))
+        await s.execute(delete(PromoRedemption).where(PromoRedemption.user_id == user.id))
         shown = user.minecraft_nick
         await s.delete(user)
         await s.commit()
     await message.answer(f"Пользователь <b>{safe(shown)}</b> полностью удалён из базы. При следующем /start ему потребуется зарегистрироваться заново.")
+
+
+# ---------------------------------------------------------------- баланс (потраченные алмазы)
+
+MAX_BALANCE_STEP = 10_000_000
+
+@router.message(Command("balance"))
+async def balance_command(message: Message):
+    """/balance <ник> — показать, /balance <ник> add|delete <алмазы> — изменить «потрачено» игрока."""
+    parts = (message.text or "").split()
+    usage = ("Использование:\n/balance &lt;nickname&gt; — сколько потратил игрок\n"
+             "/balance &lt;nickname&gt; add &lt;алмазы&gt; — добавить к потраченному\n"
+             "/balance &lt;nickname&gt; delete &lt;алмазы&gt; — убрать из потраченного")
+    if len(parts) not in (2, 4):
+        await message.answer(usage); return
+    nick = parts[1]
+    action = parts[2].lower() if len(parts) == 4 else None
+    amount = 0
+    if action is not None:
+        if action not in ("add", "delete"):
+            await message.answer(usage); return
+        if not parts[3].isdigit() or not 1 <= int(parts[3]) <= MAX_BALANCE_STEP:
+            await message.answer(f"Количество алмазов — целое число от 1 до {MAX_BALANCE_STEP}."); return
+        amount = int(parts[3])
+    async with Session() as s:
+        matches = (await s.execute(select(User).where(ci_nick(User.minecraft_nick, nick)).order_by(User.id))).scalars().all()
+        if not matches:
+            await message.answer("Игрок с таким ником не найден."); return
+        exact = [u for u in matches if u.minecraft_nick == nick]
+        if len(matches) > 1 and len(exact) != 1:
+            await message.answer("Найдено несколько игроков с таким ником (отличаются регистром). Укажи ник точно, как в /list.")
+            return
+        user = exact[0] if len(matches) > 1 else matches[0]
+        spent = int(await s.scalar(select(func.coalesce(func.sum(Sale.total_diamonds), 0)).where(Sale.user_id == user.id)) or 0)
+        if action is None:
+            await message.answer(f"Игрок <b>{safe(user.minecraft_nick)}</b> потратил: <b>{price_text(spent)}</b>."); return
+        if action == "delete" and amount > spent:
+            await message.answer(f"У игрока <b>{safe(user.minecraft_nick)}</b> потрачено только {price_text(spent)} — "
+                                 f"нельзя убрать {price_text(amount)}."); return
+        delta = amount if action == "add" else -amount
+        s.add(Sale(total_diamonds=delta, completed_at=utcnow(), user_id=user.id, is_manual=True))
+        await s.commit()
+    await message.answer(f"Игрок <b>{safe(user.minecraft_nick)}</b>: потрачено было {price_text(spent)}, "
+                         f"стало <b>{price_text(spent + delta)}</b> ({'+' if delta > 0 else '−'}{amount} алм.).")

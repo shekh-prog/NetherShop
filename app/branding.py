@@ -9,12 +9,26 @@ def ref_of(msg: Message) -> list:
     """Ссылка на сообщение бота: [chat_id, message_id, это_фото]."""
     return [msg.chat.id, msg.message_id, bool(getattr(msg, "photo", None))]
 
+# file_id логотипа: после первой отправки Telegram хранит файл у себя, и повторно заливать 2 МБ не нужно.
+_logo_file_id: str | None = None
+
+async def _send_logo(message: Message, caption: str, reply_markup=None) -> Message:
+    global _logo_file_id
+    if _logo_file_id:
+        try:
+            return await message.answer_photo(_logo_file_id, caption=caption, reply_markup=reply_markup)
+        except TelegramBadRequest:
+            _logo_file_id = None  # file_id устарел или не подходит этому боту — зальём файл заново
+    sent = await message.answer_photo(FSInputFile(LOGO_PATH), caption=caption, reply_markup=reply_markup)
+    if sent.photo:
+        _logo_file_id = sent.photo[-1].file_id
+    return sent
+
 async def send_branded(message: Message, text: str, reply_markup=None):
     if LOGO_PATH.is_file():
-        photo = FSInputFile(LOGO_PATH)
         if len(text) <= CAPTION_LIMIT:
-            return await message.answer_photo(photo, caption=text, reply_markup=reply_markup)
-        await message.answer_photo(photo, caption="<b>NetherShop</b>")
+            return await _send_logo(message, text, reply_markup)
+        await _send_logo(message, "<b>NetherShop</b>")
     return await message.answer(text, reply_markup=reply_markup)
 
 async def edit_message(bot, chat_id: int, message_id: int, text: str, reply_markup=None, photo: bool = False) -> list:

@@ -32,3 +32,15 @@ class CancelFlow(StatesGroup):
 class ProfileFlow(StatesGroup):
     new_nick = State()
     confirm_nick = State()
+
+
+class PromoFlow(StatesGroup):
+    enter_code = State()     # игрок вводит промокод
+    percent = State()        # дальше — создание промокода главой
+    name = State()
+    code = State()
+    uses = State()
+
+
+class EditFlow(StatesGroup):
+    value = State()          # глава вводит новое значение поля товара в редакторе каталога
